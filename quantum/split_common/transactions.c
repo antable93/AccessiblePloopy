@@ -14,6 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdint.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -80,8 +81,12 @@
     { 0, 0, sizeof_member(split_shared_memory_t, member), offsetof(split_shared_memory_t, member), cb }
 #define trans_target2initiator_initializer(member) trans_target2initiator_initializer_cb(member, NULL)
 
+#define trans_initiator2target_cb(cb) \
+    { 0, 0, 0, 0, cb }
+
 #define transport_write(id, data, length) transport_execute_transaction(id, data, length, NULL, 0)
 #define transport_read(id, data, length) transport_execute_transaction(id, NULL, 0, data, length)
+#define transport_exec(id) transport_execute_transaction(id, NULL, 0, NULL, 0)
 
 #if defined(SPLIT_TRANSACTION_IDS_KB) || defined(SPLIT_TRANSACTION_IDS_USER)
 // Forward-declare the RPC callback handlers
@@ -234,21 +239,39 @@ static void master_matrix_handlers_slave(matrix_row_t master_matrix[], matrix_ro
 #ifdef ENCODER_ENABLE
 
 static bool encoder_handlers_master(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
-    static uint32_t last_update = 0;
-    uint8_t         temp_state[NUM_ENCODERS_MAX_PER_SIDE];
+    static uint32_t  last_update   = 0;
+    static uint8_t   last_checksum = 0;
+    encoder_events_t temp_events;
 
-    bool okay = read_if_checksum_mismatch(GET_ENCODERS_CHECKSUM, GET_ENCODERS_DATA, &last_update, temp_state, split_shmem->encoders.state, sizeof(temp_state));
-    if (okay) encoder_update_raw(temp_state);
+    bool okay = read_if_checksum_mismatch(GET_ENCODERS_CHECKSUM, GET_ENCODERS_DATA, &last_update, &temp_events, &split_shmem->encoders.events, sizeof(temp_events));
+    if (okay) {
+        if (last_checksum != split_shmem->encoders.checksum) {
+            bool    actioned = false;
+            uint8_t index;
+            bool    clockwise;
+            while (okay && encoder_dequeue_event_advanced(&split_shmem->encoders.events, &index, &clockwise)) {
+                okay &= encoder_queue_event(index, clockwise);
+                actioned = true;
+            }
+
+            if (actioned) {
+                okay &= transport_exec(CMD_ENCODER_DRAIN);
+            }
+            last_checksum = split_shmem->encoders.checksum;
+        }
+    }
     return okay;
 }
 
 static void encoder_handlers_slave(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
-    uint8_t encoder_state[NUM_ENCODERS_MAX_PER_SIDE];
-    encoder_state_raw(encoder_state);
     // Always prepare the encoder state for read.
-    memcpy(split_shmem->encoders.state, encoder_state, sizeof(encoder_state));
+    encoder_retrieve_events(&split_shmem->encoders.events);
     // Now update the checksum given that the encoders has been written to
-    split_shmem->encoders.checksum = crc8(encoder_state, sizeof(encoder_state));
+    split_shmem->encoders.checksum = crc8(&split_shmem->encoders.events, sizeof(split_shmem->encoders.events));
+}
+
+static void encoder_handlers_slave_drain(uint8_t initiator2target_buffer_size, const void *initiator2target_buffer, uint8_t target2initiator_buffer_size, void *target2initiator_buffer) {
+    encoder_signal_queue_drain();
 }
 
 // clang-format off
@@ -256,7 +279,8 @@ static void encoder_handlers_slave(matrix_row_t master_matrix[], matrix_row_t sl
 #    define TRANSACTIONS_ENCODERS_SLAVE() TRANSACTION_HANDLER_SLAVE_AUTOLOCK(encoder)
 #    define TRANSACTIONS_ENCODERS_REGISTRATIONS \
     [GET_ENCODERS_CHECKSUM] = trans_target2initiator_initializer(encoders.checksum), \
-    [GET_ENCODERS_DATA]     = trans_target2initiator_initializer(encoders.state),
+    [GET_ENCODERS_DATA]     = trans_target2initiator_initializer(encoders.events), \
+    [CMD_ENCODER_DRAIN]     = trans_initiator2target_cb(encoder_handlers_slave_drain),
 // clang-format on
 
 #else // ENCODER_ENABLE
@@ -395,6 +419,10 @@ static bool mods_handlers_master(matrix_row_t master_matrix[], matrix_row_t slav
     if (!mods_need_sync && new_mods.oneshot_mods != split_shmem->mods.oneshot_mods) {
         mods_need_sync = true;
     }
+    new_mods.oneshot_locked_mods = get_oneshot_locked_mods();
+    if (!mods_need_sync && new_mods.oneshot_locked_mods != split_shmem->mods.oneshot_locked_mods) {
+        mods_need_sync = true;
+    }
 #    endif // NO_ACTION_ONESHOT
 
     bool okay = true;
@@ -418,6 +446,7 @@ static void mods_handlers_slave(matrix_row_t master_matrix[], matrix_row_t slave
     set_weak_mods(mods.weak_mods);
 #    ifndef NO_ACTION_ONESHOT
     set_oneshot_mods(mods.oneshot_mods);
+    set_oneshot_locked_mods(mods.oneshot_locked_mods);
 #    endif
 }
 
@@ -686,16 +715,17 @@ static bool pointing_handlers_master(matrix_row_t master_matrix[], matrix_row_t 
         return true;
     }
 #    endif
-    static uint32_t last_update = 0;
-    static uint16_t last_cpi    = 0;
+    static uint32_t last_update     = 0;
+    static uint32_t last_cpi_update = 0;
+    static uint16_t last_cpi        = 0;
     report_mouse_t  temp_state;
     uint16_t        temp_cpi;
     bool            okay = read_if_checksum_mismatch(GET_POINTING_CHECKSUM, GET_POINTING_DATA, &last_update, &temp_state, &split_shmem->pointing.report, sizeof(temp_state));
     if (okay) pointing_device_set_shared_report(temp_state);
     temp_cpi = pointing_device_get_shared_cpi();
-    if (temp_cpi && last_cpi != temp_cpi) {
+    if (temp_cpi) {
         split_shmem->pointing.cpi = temp_cpi;
-        okay                      = transport_write(PUT_POINTING_CPI, &split_shmem->pointing.cpi, sizeof(split_shmem->pointing.cpi));
+        okay                      = send_if_condition(PUT_POINTING_CPI, &last_cpi_update, last_cpi != temp_cpi, &split_shmem->pointing.cpi, sizeof(split_shmem->pointing.cpi));
         if (okay) {
             last_cpi = temp_cpi;
         }
@@ -703,7 +733,7 @@ static bool pointing_handlers_master(matrix_row_t master_matrix[], matrix_row_t 
     return okay;
 }
 
-extern const pointing_device_driver_t pointing_device_driver;
+extern const pointing_device_driver_t *pointing_device_driver;
 
 static void pointing_handlers_slave(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
 #    if defined(POINTING_DEVICE_LEFT)
@@ -723,18 +753,18 @@ static void pointing_handlers_slave(matrix_row_t master_matrix[], matrix_row_t s
     last_exec = timer_read32();
 #    endif
 
-    uint16_t temp_cpi = !pointing_device_driver.get_cpi ? 0 : pointing_device_driver.get_cpi(); // check for NULL
+    uint16_t temp_cpi = !pointing_device_driver->get_cpi ? 0 : pointing_device_driver->get_cpi(); // check for NULL
 
     split_shared_memory_lock();
     split_slave_pointing_sync_t pointing;
     memcpy(&pointing, &split_shmem->pointing, sizeof(split_slave_pointing_sync_t));
     split_shared_memory_unlock();
 
-    if (pointing.cpi && pointing.cpi != temp_cpi && pointing_device_driver.set_cpi) {
-        pointing_device_driver.set_cpi(pointing.cpi);
+    if (pointing.cpi && pointing.cpi != temp_cpi && pointing_device_driver->set_cpi) {
+        pointing_device_driver->set_cpi(pointing.cpi);
     }
 
-    pointing.report = pointing_device_driver.get_report((report_mouse_t){0});
+    pointing.report = pointing_device_driver->get_report((report_mouse_t){0});
     // Now update the checksum given that the pointing has been written to
     pointing.checksum = crc8(&pointing.report, sizeof(report_mouse_t));
 
@@ -752,6 +782,69 @@ static void pointing_handlers_slave(matrix_row_t master_matrix[], matrix_row_t s
 #    define TRANSACTIONS_POINTING_MASTER()
 #    define TRANSACTIONS_POINTING_SLAVE()
 #    define TRANSACTIONS_POINTING_REGISTRATIONS
+
+#endif // defined(POINTING_DEVICE_ENABLE) && defined(SPLIT_POINTING_ENABLE)
+
+////////////////////////////////////////////////////
+// DIGITIZER
+
+#if defined(DIGITIZER_ENABLE) && defined(SPLIT_DIGITIZER_ENABLE)
+
+static bool digitizer_handlers_master(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
+#    if defined(DIGITIZER_LEFT)
+    if (is_keyboard_left()) {
+        return true;
+    }
+#    elif defined(DIGITIZER_RIGHT)
+    if (!is_keyboard_left()) {
+        return true;
+    }
+#    endif
+    static uint32_t last_update = 0;
+    digitizer_t     temp_state;
+    bool            okay = read_if_checksum_mismatch(GET_DIGITIZER_CHECKSUM, GET_DIGITIZER_DATA, &last_update, &temp_state, &split_shmem->digitizer.report, sizeof(temp_state));
+    if (okay) digitizer_set_shared_report(temp_state);
+    return okay;
+}
+
+static void digitizer_handlers_slave(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
+#    if defined(DIGITIZER_LEFT)
+    if (!is_keyboard_left()) {
+        return;
+    }
+#    elif defined(DIGITIZER_RIGHT)
+    if (is_keyboard_left()) {
+        return;
+    }
+#    endif
+#    if (DIGITIZER_TASK_THROTTLE_MS > 0)
+    static uint32_t last_exec = 0;
+    if (timer_elapsed32(last_exec) < DIGITIZER_TASK_THROTTLE_MS) {
+        return;
+    }
+    last_exec = timer_read32();
+#    endif
+
+    split_slave_digitizer_sync_t digitizer = {};
+    digitizer.report                       = digitizer_get_state();
+
+    // Now update the checksum given that the digitizer report has been written to
+    digitizer.checksum = crc8(&digitizer.report, sizeof(digitizer_t));
+
+    split_shared_memory_lock();
+    memcpy(&split_shmem->digitizer, &digitizer, sizeof(split_slave_digitizer_sync_t));
+    split_shared_memory_unlock();
+}
+
+#    define TRANSACTIONS_DIGITIZER_MASTER() TRANSACTION_HANDLER_MASTER(digitizer)
+#    define TRANSACTIONS_DIGITIZER_SLAVE() TRANSACTION_HANDLER_SLAVE(digitizer)
+#    define TRANSACTIONS_DIGITIZER_REGISTRATIONS [GET_DIGITIZER_CHECKSUM] = trans_target2initiator_initializer(digitizer.checksum), [GET_DIGITIZER_DATA] = trans_target2initiator_initializer(digitizer.report),
+
+#else // defined(POINTING_DEVICE_ENABLE) && defined(SPLIT_POINTING_ENABLE)
+
+#    define TRANSACTIONS_DIGITIZER_MASTER()
+#    define TRANSACTIONS_DIGITIZER_SLAVE()
+#    define TRANSACTIONS_DIGITIZER_REGISTRATIONS
 
 #endif // defined(POINTING_DEVICE_ENABLE) && defined(SPLIT_POINTING_ENABLE)
 
@@ -835,11 +928,12 @@ static bool activity_handlers_master(matrix_row_t master_matrix[], matrix_row_t 
     activity_sync.matrix_timestamp          = last_matrix_activity_time();
     activity_sync.encoder_timestamp         = last_encoder_activity_time();
     activity_sync.pointing_device_timestamp = last_pointing_device_activity_time();
+    activity_sync.digitizer_timestamp       = last_digitizer_activity_time();
     return send_if_data_mismatch(PUT_ACTIVITY, &last_update, &activity_sync, &split_shmem->activity_sync, sizeof(activity_sync));
 }
 
 static void activity_handlers_slave(matrix_row_t master_matrix[], matrix_row_t slave_matrix[]) {
-    set_activity_timestamps(split_shmem->activity_sync.matrix_timestamp, split_shmem->activity_sync.encoder_timestamp, split_shmem->activity_sync.pointing_device_timestamp);
+    set_activity_timestamps(split_shmem->activity_sync.matrix_timestamp, split_shmem->activity_sync.encoder_timestamp, split_shmem->activity_sync.pointing_device_timestamp, split_shmem->activity_sync.digitizer_timestamp);
 }
 
 // clang-format off
@@ -910,6 +1004,7 @@ split_transaction_desc_t split_transaction_table[NUM_TOTAL_TRANSACTIONS] = {
     TRANSACTIONS_OLED_REGISTRATIONS
     TRANSACTIONS_ST7565_REGISTRATIONS
     TRANSACTIONS_POINTING_REGISTRATIONS
+    TRANSACTIONS_DIGITIZER_REGISTRATIONS
     TRANSACTIONS_WATCHDOG_REGISTRATIONS
     TRANSACTIONS_HAPTIC_REGISTRATIONS
     TRANSACTIONS_ACTIVITY_REGISTRATIONS
@@ -940,6 +1035,7 @@ bool transactions_master(matrix_row_t master_matrix[], matrix_row_t slave_matrix
     TRANSACTIONS_OLED_MASTER();
     TRANSACTIONS_ST7565_MASTER();
     TRANSACTIONS_POINTING_MASTER();
+    TRANSACTIONS_DIGITIZER_MASTER();
     TRANSACTIONS_WATCHDOG_MASTER();
     TRANSACTIONS_HAPTIC_MASTER();
     TRANSACTIONS_ACTIVITY_MASTER();
@@ -963,6 +1059,7 @@ void transactions_slave(matrix_row_t master_matrix[], matrix_row_t slave_matrix[
     TRANSACTIONS_OLED_SLAVE();
     TRANSACTIONS_ST7565_SLAVE();
     TRANSACTIONS_POINTING_SLAVE();
+    TRANSACTIONS_DIGITIZER_SLAVE();
     TRANSACTIONS_WATCHDOG_SLAVE();
     TRANSACTIONS_HAPTIC_SLAVE();
     TRANSACTIONS_ACTIVITY_SLAVE();
